@@ -12,6 +12,7 @@ export interface Poll {
   status: VoteStatus;
   candidates: Candidate[];
   sessionId: string;
+  createdAt: number;
 }
 
 export interface GlobalState {

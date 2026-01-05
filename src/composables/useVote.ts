@@ -4,7 +4,6 @@ import { db } from '../firebase';
 import {
   ref as dbRef,
   onValue,
-  push,
   set,
   remove,
   runTransaction,
@@ -17,18 +16,6 @@ const state = ref<GlobalState>({
   activePollId: null,
 });
 
-// --- Firebase Listeners ---
-// Sync polls
-onValue(dbRef(db, 'polls'), (snapshot) => {
-  const data = snapshot.val();
-  if (data) {
-    // Convert object to array
-    state.value.polls = Object.keys(data).map(key => data[key]);
-  } else {
-    state.value.polls = [];
-  }
-});
-
 const createParams = (): Poll => ({
   id: crypto.randomUUID(),
   title: 'New Vote',
@@ -38,6 +25,21 @@ const createParams = (): Poll => ({
     { id: crypto.randomUUID(), name: 'Option B', votes: 0 },
   ],
   sessionId: crypto.randomUUID(),
+  createdAt: Date.now(),
+});
+
+// --- Firebase Listeners ---
+// Sync polls
+onValue(dbRef(db, 'polls'), (snapshot) => {
+  const data = snapshot.val();
+  if (data) {
+    // Convert object to array and sort by createdAt descending (newest first)
+    state.value.polls = Object.keys(data)
+      .map(key => data[key] as Poll)
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  } else {
+    state.value.polls = [];
+  }
 });
 
 // --- Active Poll Computed ---
@@ -154,8 +156,15 @@ export function useVote() {
       // Update specific path to avoid overwriting other things? 
       // Array updates are tricky. simple update of array is safer for this scale.
       const newCandidates = [...p.candidates];
-      newCandidates[idx] = { ...newCandidates[idx], name };
-      update(dbRef(db, `polls/${p.id}`), { candidates: newCandidates });
+      const target = newCandidates[idx];
+      if (target) {
+        newCandidates[idx] = {
+          id: target.id,
+          votes: target.votes,
+          name
+        };
+        update(dbRef(db, `polls/${p.id}`), { candidates: newCandidates });
+      }
     }
   };
 
