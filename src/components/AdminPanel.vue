@@ -11,6 +11,7 @@ const {
   setActivePoll,
   addCandidate, 
   removeCandidate, 
+  updateCandidateName,
   updateTitle, 
   setStatus, 
   resetVote, 
@@ -35,9 +36,18 @@ const handleAdd = () => {
   }
 };
 
-const handleCreatePoll = () => {
-  const id = createPoll();
-  setActivePoll(id);
+const isCreating = ref(false);
+
+const handleCreatePoll = async () => {
+  isCreating.value = true;
+  try {
+    const id = await createPoll();
+    setActivePoll(id);
+  } catch (e) {
+    // Error already alerted
+  } finally {
+    isCreating.value = false;
+  }
 };
 
 const handleDeletePoll = (id: string, event: Event) => {
@@ -222,10 +232,11 @@ const handleExport = async () => {
   
           <button 
             @click="handleCreatePoll"
-            class="mt-3 flex items-center justify-center gap-2 w-full py-2 rounded-lg border border-dashed border-slate-600 text-slate-400 hover:text-white hover:border-slate-400 hover:bg-white/5 transition-all duration-200 ease-in-out cursor-pointer text-sm font-medium"
+            :disabled="isCreating"
+            class="mt-3 flex items-center justify-center gap-2 w-full py-2 rounded-lg border border-dashed border-slate-600 text-slate-400 hover:text-white hover:border-slate-400 hover:bg-white/5 transition-all duration-200 ease-in-out cursor-pointer text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            <PlusIcon class="w-4 h-4" />
-            New Poll
+            <span v-if="isCreating" class="animate-pulse">Creating...</span>
+            <span v-else class="flex items-center gap-2"><PlusIcon class="w-4 h-4" /> New Poll</span>
           </button>
         </div>
   
@@ -348,7 +359,13 @@ const handleExport = async () => {
             <div class="w-8 h-8 rounded-full bg-indigo-500/20 flex items-center justify-center text-indigo-400 font-bold shrink-0">
               {{ index + 1 }}
             </div>
-            <span class="flex-1 font-medium truncate">{{ candidate.name }}</span>
+            <input 
+              :value="candidate.name"
+              @input="(e) => updateCandidateName(candidate.id, (e.target as HTMLInputElement).value)"
+              class="input-field flex-1 font-medium bg-transparent border-none p-0 text-white placeholder-slate-500 disabled:opacity-50"
+              placeholder="Option name"
+              :disabled="activePoll.status === 'ended'"
+            />
             <button 
               @click="removeCandidate(candidate.id)"
               title="Remove candidate"

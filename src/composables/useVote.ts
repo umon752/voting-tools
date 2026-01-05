@@ -1,7 +1,20 @@
-import { ref, computed, watch } from 'vue';
+import { ref, computed } from 'vue';
 import type { Poll, GlobalState, VoteStatus } from '../types';
+import { db } from '../firebase';
+import {
+  ref as dbRef,
+  onValue,
+  set,
+  remove,
+  runTransaction,
+  update
+} from 'firebase/database';
 
-const STORAGE_KEY = 'voting-tool-state-v2';
+// Initial empty state
+const state = ref<GlobalState>({
+  polls: [],
+  activePollId: null,
+});
 
 const createParams = (): Poll => ({
   id: crypto.randomUUID(),
@@ -12,36 +25,22 @@ const createParams = (): Poll => ({
     { id: crypto.randomUUID(), name: 'Option B', votes: 0 },
   ],
   sessionId: crypto.randomUUID(),
+  createdAt: Date.now(),
 });
 
-const defaultState: GlobalState = {
-  polls: [createParams()],
-  activePollId: null,
-};
-defaultState.activePollId = defaultState.polls[0]?.id || '';
-
-const state = ref<GlobalState>(defaultState);
-
-// Initialize from local storage
-const stored = localStorage.getItem(STORAGE_KEY);
-if (stored) {
-  try {
-    const parsed = JSON.parse(stored);
-    if (parsed.polls && Array.isArray(parsed.polls)) {
-      state.value = { ...defaultState, ...parsed };
-    } else {
-      console.warn('Old data format detected, starting fresh.');
-      state.value = defaultState;
-    }
-  } catch (e) {
-    console.error('Failed to parse stored items', e);
+// --- Firebase Listeners ---
+// Sync polls
+onValue(dbRef(db, 'polls'), (snapshot) => {
+  const data = snapshot.val();
+  if (data) {
+    // Convert object to array and sort by createdAt descending (newest first)
+    state.value.polls = Object.keys(data)
+      .map(key => data[key] as Poll)
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  } else {
+    state.value.polls = [];
   }
-}
-
-// Watch for changes and save
-watch(state, (newVal) => {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(newVal));
-}, { deep: true });
+});
 
 // --- Active Poll Computed ---
 const activePoll = computed(() => {
@@ -49,10 +48,7 @@ const activePoll = computed(() => {
   return state.value.polls.find(p => p.id === state.value.activePollId) || null;
 });
 
-// --- Voting Logic (Scoped to Poll ID) ---
-// We no longer rely on a single global hasVoted ref for the view, 
-// but we keep the helper for checking specific polls.
-
+// --- Local Helpers ---
 const hasVotedFor = (pollId: string, currentSessionId: string) => {
   const key = `voted_${pollId}`;
   const record = localStorage.getItem(key);
@@ -61,11 +57,25 @@ const hasVotedFor = (pollId: string, currentSessionId: string) => {
 
 export function useVote() {
 
-  // --- Poll Management ---
-  const createPoll = () => {
+  const getActivePollOrThrow = () => {
+    const p = state.value.polls.find(p => p.id === state.value.activePollId);
+    if (!p) throw new Error("No active poll");
+    return p;
+  };
+
+  // --- Actions (Write to Firebase) ---
+
+  const createPoll = async () => {
     const newPoll = createParams();
-    state.value.polls.push(newPoll);
-    return newPoll.id;
+    try {
+      await set(dbRef(db, `polls/${newPoll.id}`), newPoll);
+      console.log('Poll created successfully');
+      return newPoll.id;
+    } catch (err) {
+      console.error('Error creating poll:', err);
+      alert('Failed to create poll. Check console for details. (Is Firebase config correct?)');
+      throw err;
+    }
   };
 
   const deletePoll = (id: string) => {
@@ -73,84 +83,122 @@ export function useVote() {
       alert("Cannot delete the last poll.");
       return;
     }
-    state.value.polls = state.value.polls.filter(p => p.id !== id);
+    remove(dbRef(db, `polls/${id}`));
+
     if (state.value.activePollId === id) {
-      state.value.activePollId = state.value.polls[0]?.id || null;
+      state.value.activePollId = null;
     }
   };
 
   const setActivePoll = (id: string) => {
+    // Local state only
     state.value.activePollId = id;
-  };
-
-  // --- Helpers ---
-  const getActivePollOrThrow = () => {
-    const p = state.value.polls.find(p => p.id === state.value.activePollId);
-    if (!p) throw new Error("No active poll");
-    return p;
-  };
-
-  // --- Actions ---
-  const resetVote = () => {
-    const p = getActivePollOrThrow();
-    const fresh = createParams();
-    p.title = fresh.title;
-    p.candidates = fresh.candidates;
-    p.status = 'setup';
-    p.sessionId = crypto.randomUUID();
-  };
-
-  const resetVotesOnly = () => {
-    const p = getActivePollOrThrow();
-    p.status = 'setup';
-    p.candidates = p.candidates.map(c => ({ ...c, votes: 0 }));
-    p.sessionId = crypto.randomUUID();
-  };
-
-  const addCandidate = (name: string) => {
-    const p = getActivePollOrThrow();
-    p.candidates.push({
-      id: crypto.randomUUID(),
-      name,
-      votes: 0,
-    });
-  };
-
-  const removeCandidate = (id: string) => {
-    const p = getActivePollOrThrow();
-    p.candidates = p.candidates.filter(c => c.id !== id);
   };
 
   const updateTitle = (title: string) => {
     const p = getActivePollOrThrow();
-    p.title = title;
+    update(dbRef(db, `polls/${p.id}`), { title });
   };
 
   const setStatus = (status: VoteStatus) => {
     const p = getActivePollOrThrow();
-    p.status = status;
+    update(dbRef(db, `polls/${p.id}`), { status });
+  };
+
+  const resetVote = () => {
+    const p = getActivePollOrThrow();
+    const fresh = createParams();
+    // Keep ID, reset others
+    update(dbRef(db, `polls/${p.id}`), {
+      title: fresh.title,
+      candidates: fresh.candidates,
+      status: 'setup',
+      sessionId: crypto.randomUUID()
+    });
+  };
+
+  const resetVotesOnly = () => {
+    const p = getActivePollOrThrow();
+    const newCandidates = p.candidates.map(c => ({ ...c, votes: 0 }));
+    update(dbRef(db, `polls/${p.id}`), {
+      status: 'setup',
+      candidates: newCandidates,
+      sessionId: crypto.randomUUID()
+    });
+  };
+
+  // Candidates
+  // Note: Since candidates are an array, updating one means rewriting the array 
+  // or dealing with array indices which is race-condition prone in Firebase if using indices.
+  // Best practice is object map, but to keep refactor minimal we will write whole candidates array for add/remove.
+  // For voting, we can try to be specific if we know the index, but finding by ID is safer for 'votes' count transaction.
+
+  const addCandidate = (name: string) => {
+    const p = getActivePollOrThrow();
+    const newCandidates = [...p.candidates, {
+      id: crypto.randomUUID(),
+      name,
+      votes: 0,
+    }];
+    update(dbRef(db, `polls/${p.id}`), { candidates: newCandidates });
+  };
+
+  const removeCandidate = (id: string) => {
+    const p = getActivePollOrThrow();
+    const newCandidates = p.candidates.filter(c => c.id !== id);
+    update(dbRef(db, `polls/${p.id}`), { candidates: newCandidates });
+  };
+
+  const updateCandidateName = (candidateId: string, name: string) => {
+    const p = getActivePollOrThrow();
+    const idx = p.candidates.findIndex(c => c.id === candidateId);
+    if (idx !== -1) {
+      // Update specific path to avoid overwriting other things? 
+      // Array updates are tricky. simple update of array is safer for this scale.
+      const newCandidates = [...p.candidates];
+      const target = newCandidates[idx];
+      if (target) {
+        newCandidates[idx] = {
+          id: target.id,
+          votes: target.votes,
+          name
+        };
+        update(dbRef(db, `polls/${p.id}`), { candidates: newCandidates });
+      }
+    }
   };
 
   const castVote = (pollId: string, candidateId: string) => {
     const p = state.value.polls.find(poll => poll.id === pollId);
     if (!p) return;
 
-    // Double check if already voted
     if (hasVotedFor(p.id, p.sessionId)) return;
 
-    const candidate = p.candidates.find(c => c.id === candidateId);
+    // Use transaction to safely increment votes
+    // We need to find the correct index in the DB array
+    const candidatesRef = dbRef(db, `polls/${pollId}/candidates`);
 
-    if (candidate) {
-      candidate.votes++;
-      const key = `voted_${p.id}`;
+    runTransaction(candidatesRef, (candidates) => {
+      if (candidates) {
+        const candidate = candidates.find((c: any) => c.id === candidateId);
+        if (candidate) {
+          candidate.votes = (candidate.votes || 0) + 1;
+        }
+      }
+      return candidates;
+    }).then(() => {
+      // Only mark local voted AFTER successful transaction
+      const key = `voted_${pollId}`;
       localStorage.setItem(key, p.sessionId);
-    }
+    }).catch(err => {
+      console.error("Vote failed", err);
+    });
   };
 
   const startAllVoting = () => {
     state.value.polls.forEach(poll => {
       if (poll.status === 'setup') {
-        poll.status = 'voting';
+        update(dbRef(db, `polls/${poll.id}`), { status: 'voting' });
       }
     });
   };
@@ -158,33 +206,34 @@ export function useVote() {
   const endAllVoting = () => {
     state.value.polls.forEach(poll => {
       if (poll.status === 'voting') {
-        poll.status = 'ended';
+        update(dbRef(db, `polls/${poll.id}`), { status: 'ended' });
       }
     });
   };
 
   const resetAllVotes = () => {
     state.value.polls.forEach(poll => {
-      poll.status = 'setup';
-      poll.candidates = poll.candidates.map(c => ({ ...c, votes: 0 }));
-      poll.sessionId = crypto.randomUUID();
+      const newCandidates = poll.candidates.map(c => ({ ...c, votes: 0 }));
+      update(dbRef(db, `polls/${poll.id}`), {
+        status: 'setup',
+        candidates: newCandidates,
+        sessionId: crypto.randomUUID()
+      });
     });
   };
 
   return {
-    // Global
     state,
     activePoll,
     createPoll,
     deletePoll,
     setActivePoll,
-    // Helpers
     hasVotedFor,
-    // Active Poll Actions
     resetVote,
     resetVotesOnly,
     addCandidate,
     removeCandidate,
+    updateCandidateName,
     updateTitle,
     setStatus,
     castVote,
